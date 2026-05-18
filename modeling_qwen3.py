@@ -260,12 +260,12 @@ class Qwen3Attention(nn.Module):
         self.is_causal = True
         self.attention_dropout = config.attention_dropout
         self.use_qk_norm = config.use_qk_norm
+
+        # 🌟 核心创新点开关：是否启用头级别(headwise)或元素级别(elementwise)的输出门控
         self.headwise_attn_output_gate = config.headwise_attn_output_gate
         self.elementwise_attn_output_gate = config.elementwise_attn_output_gate
 
-        # Precompute reciprocal sqrt of head_dim to avoid repeated math.sqrt calls in forward
-        # Small micro-optimization: multiplication is slightly faster than division and avoids calling
-        # math.sqrt every forward pass.
+        # 预先计算 head_dim 的平方根的倒数，用于缩放注意力分数 (1 / sqrt(d))，优化计算速度
         self.inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
 
         # if (self.head_dim * self.num_heads) != self.hidden_size:
@@ -273,13 +273,18 @@ class Qwen3Attention(nn.Module):
         #         f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
         #         f" and `num_heads`: {self.num_heads})."
         #     )
+        # 🌟 Q 矩阵的投影层 (关键修改处)
+        # 如果启用了 headwise 门控，Q投影的输出维度除了原有的 Q 向量外，还多出 self.num_heads 个维度，用来生成每个头的门控分数。
         if self.headwise_attn_output_gate:
             self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim + self.num_heads, bias=config.qkv_bias)
+        # 如果启用了 elementwise 门控，Q投影的输出维度翻倍，一半用于真正的 Q，一半用于每个元素的门控分数。
         elif self.elementwise_attn_output_gate:
             self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim * 2, bias=config.qkv_bias)
+        # 默认情况：标准的 Q 投影
         else:
             self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.qkv_bias)
 
+        # K, V, O (输出) 的投影矩阵，注意 K 和 V 使用的是 num_key_value_heads，体现了 GQA 机制
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.qkv_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.qkv_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.qkv_bias)
@@ -306,14 +311,22 @@ class Qwen3Attention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
+        # 🌟 门控分数的切分与重塑逻辑
         if self.headwise_attn_output_gate:
+            # 重塑 Q 以适应 GQA 分组
             query_states = query_states.view(bsz, q_len, self.num_key_value_heads, -1)
+            # 沿着最后一个维度，将 Q 拆分为真正的 query_states 和 门控分数 gate_score
             query_states, gate_score = torch.split(query_states, [self.head_dim * self.num_key_value_groups, self.num_key_value_groups], dim=-1)
+            # 门控分数的形状变为 (bsz, q_len, num_heads, 1)，即每个注意力头一个标量分数
             gate_score = gate_score.reshape(bsz, q_len, -1, 1)
+            # 把真正的 Q 重塑回多头注意力的标准形状并转置：(bsz, num_heads, q_len, head_dim)
             query_states = query_states.reshape(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         elif self.elementwise_attn_output_gate:
+            # 重塑 Q 以适应 GQA 分组
             query_states = query_states.view(bsz, q_len, self.num_key_value_heads, -1)
+            # 对半切分，一半是 Q，一半是元素级别的门控分数
             query_states, gate_score = torch.split(query_states, [self.head_dim * self.num_key_value_groups, self.head_dim * self.num_key_value_groups], dim=-1)
+            # 门控分数的形状变为 (bsz, q_len, num_heads, head_dim)，每个特征维度都有一个分数
             gate_score = gate_score.reshape(bsz, q_len, -1, self.head_dim)
             query_states = query_states.reshape(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         else:
@@ -348,6 +361,8 @@ class Qwen3Attention(nn.Module):
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
 
+        # attn_output 就是 将注意力权重与 V 相乘 (Softmax(Q*K^T/sqrt(d)) * V) 的结果
+        # 后面拿去做门控
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -358,7 +373,12 @@ class Qwen3Attention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous()
 
+        # 🌟 应用门控注意力 (Gated Attention) 的核心操作
         if self.headwise_attn_output_gate or self.elementwise_attn_output_gate:
+            # 将之前从 Q 中切分出来的 gate_score 通过 Sigmoid 函数将其值压缩到 (0, 1) 之间。
+            # 然后用这个门控值去乘以注意力的输出 (attn_output)。
+            # 这允许模型动态决定哪些注意力头的输出（或者哪些具体维度的输出）是重要的，哪些应该被抑制。
+            # 完美对应 Y' = Y ⊙ σ(gate_score)
             attn_output = attn_output * torch.sigmoid(gate_score)
 
         attn_output = attn_output.reshape(bsz, q_len, -1)
